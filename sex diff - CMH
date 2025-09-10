@@ -1,295 +1,90 @@
-# 5 ── Global Female vs Male OR forest plot ----------------------------------
-# Build 2×2 tables: AE vs rest × sex (all drugs pooled)
-orc_totals <- df_cv |> count(sex, name = "total")
+# Adjusted Female vs Male Odds Ratios for Cardiovascular Adverse Events
 
-ae_or_df <- df_cv |> 
-  count(canon_term, sex, name = "a") |> 
-  left_join(orc_totals, by = "sex") |> 
-  mutate(b = total - a) |> 
-  select(-total) |> 
-  tidyr::pivot_wider(names_from = sex, values_from = c(a, b), values_fill = 0) |> 
-  mutate(
-    or   = (a_F * b_M) / (b_F * a_M),
-    se   = sqrt(1 / a_F + 1 / b_F + 1 / a_M + 1 / b_M),
-    l95  = exp(log(or) - 1.96 * se),
-    u95  = exp(log(or) + 1.96 * se)
-  )
-
-sig_forest_df <- ae_or_df |> 
-  filter((l95 > 1 & or > 1) | (u95 < 1 & or < 1)) |> 
-  mutate(sex = factor(ifelse(or > 1, "Female", "Male"), levels = c("Female", "Male")))
-
-forest_plot <- ggplot(sig_forest_df,
-                      aes(x = or,
-                          y = forcats::fct_reorder(canon_term, or),
-                          colour = sex, shape = sex)) +
-  geom_pointrange(aes(xmin = l95, xmax = u95),
-                  position = position_dodge(width = 0.6),
-                  size = 0.9) +
-  geom_point(position = position_dodge(width = 0.6), size = 2) +
-  geom_vline(xintercept = 1, linetype = "dashed") +
-  scale_x_log10(breaks = c(0.5, 1, 1.5, 3)) +
-  scale_colour_manual(values = c("Female" = "#C51B7D", "Male" = "#0087BD"),
-                      labels = c("Female" = "Higher in females", "Male" = "Higher in males"),
-                      name = NULL) +
-  scale_shape_manual(values = c("Female" = 16, "Male" = 17),
-                     labels = c("Female" = "Higher in females", "Male" = "Higher in males"),
-                     name = NULL) +
-  labs(title = "Sex-specific Odds Ratios for Cardiovascular Adverse Events",
-       x = "Odds ratio (Female vs Male, log scale)",
-       y = NULL,
-       caption = "Only AE categories whose 95 % CI excludes 1 are shown.  Points offset vertically for clarity.") +
-  theme_minimal(base_size = 11) +
-  theme(legend.position = "bottom")
-print(forest_plot)
-# ──------------------------------------------------------------------------------------------------------
-
-ae_or_df <- df_cv %>%
-  filter(sex %in% c("F","M")) %>%
-  distinct(case_id, sex, canon_term) %>%                        # report-level
-  { base <- .
-  totals <- base %>% distinct(case_id, sex) %>% count(sex, name = "total")
-  base %>%
-    count(canon_term, sex, name = "a") %>%
-    left_join(totals, by = "sex") %>%
-    mutate(b = pmax(total - a, 0L)) %>%
-    select(-total) %>%
-    pivot_wider(names_from = sex, values_from = c(a, b), values_fill = 0) %>%
-    mutate(
-      # Wald OR & CI with 0.5 CC if any zero cell
-      cc = if_else(a_F==0 | b_F==0 | a_M==0 | b_M==0, 0.5, 0),
-      aF = a_F + cc, bF = b_F + cc, aM = a_M + cc, bM = b_M + cc,
-      OR  = (aF * bM) / (bF * aM),
-      SE  = sqrt(1/aF + 1/bF + 1/aM + 1/bM),
-      L95 = exp(log(OR) - 1.96*SE),
-      U95 = exp(log(OR) + 1.96*SE),
-      z   = log(OR) / SE,
-      p_wald     = 2*pnorm(abs(z), lower.tail = FALSE),
-      p_wald_adj = p.adjust(p_wald, method = "BH")
-    ) %>%
-    # mid-p Fisher p-value on raw integer cells (no CC)
-    rowwise() %>%
-    mutate(p_fisher_midp = fisher.exact(matrix(c(a_F, b_F, a_M, b_M), 2, byrow = TRUE),
-                                        alternative = "two.sided", midp = TRUE)$p.value) %>%
-    ungroup() %>%
-    mutate(p_fisher_adj = p.adjust(p_fisher_midp, method = "BH"))
-  }
-
-# Optional quick comparison of calls between tests
-method_summary <- ae_or_df %>%
-  transmute(canon_term,
-            sig_wald = p_wald_adj < 0.05,
-            sig_fisher = p_fisher_adj < 0.05) %>%
-  mutate(category = case_when(
-    sig_wald & sig_fisher ~ "Both",
-    sig_wald & !sig_fisher ~ "Wald only",
-    !sig_wald & sig_fisher ~ "Fisher only",
-    TRUE ~ "Neither"
-  )) %>%
-  count(category, name = "N")
-
-print(method_summary)
-  
-# ──-----------------------------------------------------
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(ggplot2)
+library(forcats)
 
 # Per-drug, per-sex counts at report level
 counts <- df_cv %>%
-  filter(sex %in% c("F","M")) %>%
+  filter(sex %in% c("F", "M")) %>%
   distinct(case_id, sex, drug_simple, canon_term) %>%
   count(canon_term, drug_simple, sex, name = "a") %>%
   left_join(
-    df_cv %>% filter(sex %in% c("F","M")) %>%
+    df_cv %>%
+      filter(sex %in% c("F", "M")) %>%
       distinct(case_id, sex, drug_simple) %>%
       count(drug_simple, sex, name = "tot"),
-    by = c("drug_simple","sex")
+    by = c("drug_simple", "sex")
   ) %>%
   mutate(a = coalesce(a, 0L), tot = coalesce(tot, 0L))
 
+# Cochran–Mantel–Haenszel common odds ratios by event category
 cmh_results <- counts %>%
-  group_by(canon_term) %>% group_split() %>%
+  group_by(canon_term) %>%
+  group_split() %>%
   map_df(function(df) {
-    # summarise to one row per drug stratum with complete cells
     strata <- df %>%
       group_by(drug_simple) %>%
       summarise(
-        a_F  = first(a[sex=="F"],  default = 0L),
-        a_M  = first(a[sex=="M"],  default = 0L),
-        tot_F= first(tot[sex=="F"],default = 0L),
-        tot_M= first(tot[sex=="M"],default = 0L),
+        a_F  = first(a[sex == "F"],  default = 0L),
+        a_M  = first(a[sex == "M"],  default = 0L),
+        tot_F = first(tot[sex == "F"], default = 0L),
+        tot_M = first(tot[sex == "M"], default = 0L),
         .groups = "drop"
       ) %>%
       mutate(
         b_F = pmax(tot_F - a_F, 0L),
         b_M = pmax(tot_M - a_M, 0L)
       ) %>%
-      # drop strata with zero total in both sexes (no info)
-      filter(tot_F + tot_M > 0)
-    
-    if (nrow(strata) == 0) {
-      return(tibble(canon_term = df$canon_term[1],
-                    or_mh = NA_real_, l95_mh = NA_real_, u95_mh = NA_real_, p_cmh = NA_real_))
-    }
-    
-    # build 2x2xK array safely
-    K <- nrow(strata)
-    arr <- array(0, dim = c(2, 2, K),
-                 dimnames = list(c("F","M"), c("AE","Rest"), NULL))
-    for (i in seq_len(K)) {
-      arr[,,i] <- matrix(c(strata$a_F[i], strata$b_F[i],
-                           strata$a_M[i], strata$b_M[i]),
-                         nrow = 2, byrow = TRUE)
-    }
-    
-    mt <- mantelhaen.test(arr, correct = FALSE)
+      filter(
+        (a_F + b_F) > 0 & (a_M + b_M) > 0 &
+        (a_F + a_M) > 0 & (b_F + b_M) > 0
+      )
+
+    mh <- mantelhaen.test(
+      x = array(
+        c(strata$a_F, strata$b_F, strata$a_M, strata$b_M),
+        dim = c(2, 2, nrow(strata))
+      ),
+      alternative = "two.sided",
+      correct = FALSE
+    )
+
     tibble(
       canon_term = df$canon_term[1],
-      or_mh  = unname(mt$estimate),
-      l95_mh = unname(mt$conf.int[1]),
-      u95_mh = unname(mt$conf.int[2]),
-      p_cmh  = mt$p.value
+      or_mh  = mh$estimate,
+      l95_mh = mh$conf.int[1],
+      u95_mh = mh$conf.int[2],
+      p_cmh  = mh$p.value
     )
   }) %>%
-  mutate(
-    p_cmh_adj = p.adjust(p_cmh, "BH"),
-    direction = case_when(
-      or_mh > 1 ~ "Higher in females",
-      or_mh < 1 ~ "Higher in males",
-      TRUE ~ "No difference"
-    )
-  )
+  mutate(p_cmh_adj = p.adjust(p_cmh, method = "BH")) %>%
+  arrange(p_cmh_adj)
 
-cmh_sig <- cmh_results %>%
-  filter(!is.na(or_mh), is.finite(or_mh), p_cmh_adj < 0.05) %>%
-  arrange(desc(abs(log(or_mh))))
+# Plot significant results
+sig_cmh <- cmh_results %>%
+  filter(p_cmh_adj < 0.05) %>%
+  mutate(direction = if_else(or_mh > 1, "Higher in females", "Higher in males"))
 
-# quick tabulation
-cmh_sig %>% count(direction)
-
-# forest (top 25 by |log OR_MH|); OR_MH > 1 = female; < 1 = male
-ggplot(cmh_sig %>% slice_head(n = 25),
-       aes(or_mh, fct_reorder(canon_term, abs(log(or_mh))),
-           color = direction, shape = direction)) +
+ggplot(
+  sig_cmh,
+  aes(x = or_mh, y = fct_reorder(canon_term, or_mh), color = direction, shape = direction)
+) +
   geom_pointrange(aes(xmin = l95_mh, xmax = u95_mh), size = 0.9) +
   geom_point(size = 2) +
   geom_vline(xintercept = 1, linetype = "dashed") +
   scale_x_log10(breaks = c(0.5, 1, 1.5, 3, 5)) +
-  scale_color_manual(values = c("Higher in females"="#C51B7D","Higher in males"="#0087BD")) +
-  scale_shape_manual(values = c("Higher in females"=16,"Higher in males"=17)) +
-  labs(title = "Adjusted Sex Differences in Cardiovascular Adverse Events",
-       subtitle = "Female–male odds ratios adjusted for drug; confidence intervals at 95%. BH-adjusted p < 0.05",
-       x = "Common odds ratio (log scale)", y = NULL, color = NULL, shape = NULL) +
-  theme_minimal(11) + theme(legend.position = "bottom")
-
-pooled_wald <- df_cv %>%
-  dplyr::filter(sex %in% c("F","M")) %>%
-  dplyr::distinct(case_id, sex, canon_term) %>%
-  dplyr::count(canon_term, sex, name = "a") %>%
-  dplyr::left_join(dplyr::count(dplyr::distinct(df_cv, case_id, sex), sex, name="total"), by="sex") %>%
-  dplyr::mutate(b = pmax(total - a, 0L)) %>%
-  tidyr::pivot_wider(names_from = sex, values_from = c(a,b), values_fill = 0) %>%
-  dplyr::mutate(cc = ifelse(a_F==0|b_F==0|a_M==0|b_M==0, 0.5, 0),
-                aF=a_F+cc, bF=b_F+cc, aM=a_M+cc, bM=b_M+cc,
-                OR=(aF*bM)/(bF*aM),
-                SE=sqrt(1/aF+1/bF+1/aM+1/bM),
-                p_wald=2*pnorm(abs(log(OR)/SE), lower.tail=FALSE),
-                p_wald_adj=p.adjust(p_wald,"BH")) %>%
-  dplyr::transmute(canon_term, OR_pooled=OR, p_wald_adj)
-
-# Compare to CMH (drug-adjusted) results you computed
-compare <- cmh_results %>%
-  dplyr::select(canon_term, or_mh, p_cmh_adj) %>%
-  dplyr::left_join(pooled_wald, by="canon_term") %>%
-  dplyr::mutate(
-    sig_pooled = p_wald_adj < 0.05,
-    sig_cmh    = p_cmh_adj  < 0.05,
-    category = dplyr::case_when(
-      sig_pooled &  sig_cmh ~ "Both",
-      sig_pooled & !sig_cmh ~ "Pooled only (drug confounding)",
-      !sig_pooled &  sig_cmh ~ "CMH only",
-      TRUE                  ~ "Neither"
-    )
-  )
-
-table(compare$category)
-  
-# ── Build 2×2 per AE: (Female vs Male) × (AE vs rest), case-based, all drugs pooled
-ae_or_df_new <- df_cv %>%
-  filter(sex %in% c("F","M")) %>%
-  distinct(case_id, sex, canon_term) %>%
-  count(canon_term, sex, name = "a") %>%
-  left_join(
-    df_events_all %>% filter(sex %in% c("F","M")) %>%
-      distinct(case_id, sex) %>% count(sex, name = "total"),
-    by = "sex"
-  ) %>%
-  mutate(b = pmax(total - a, 0L)) %>%
-  select(-total) %>%
-  pivot_wider(names_from = sex, values_from = c(a, b), values_fill = 0) %>%
-  # --- WALD log-OR, with 0.5 CC when needed (for OR/SE/CI only)
-  mutate(
-    cc   = if_else(a_F==0 | b_F==0 | a_M==0 | b_M==0, 0.5, 0),
-    aF = a_F + cc, bF = b_F + cc, aM = a_M + cc, bM = b_M + cc,
-    or   = (aF * bM) / (bF * aM),
-    se   = sqrt(1/aF + 1/bF + 1/aM + 1/bM),
-    l95  = exp(log(or) - 1.96 * se),
-    u95  = exp(log(or) + 1.96 * se),
-    z    = log(or) / se,
-    p_wald      = 2 * pnorm(abs(z), lower.tail = FALSE),
-    p_wald_adj  = p.adjust(p_wald, method = "BH")
-  ) %>%
-  # --- mid-p Fisher on the raw integer cells (no continuity correction)
-  rowwise() %>%
-  mutate(
-    p_fisher_midp = fisher.exact(matrix(c(a_F, b_F, a_M, b_M), nrow = 2, byrow = TRUE),
-                                 alternative = "two.sided", midp = TRUE)$p.value
-  ) %>%
-  ungroup() %>%
-  mutate(p_fisher_adj = p.adjust(p_fisher_midp, method = "BH"))
-
-# ── Show differences between methods
-method_compare <- ae_or_df %>%
-  transmute(
-    canon_term, or, l95, u95,
-    sig_wald   = p_wald_adj   < 0.05,
-    sig_fisher = p_fisher_adj < 0.05
-  ) %>%
-  mutate(category = case_when(
-    sig_wald & sig_fisher ~ "Both",
-    sig_wald & !sig_fisher ~ "Wald only",
-    !sig_wald & sig_fisher ~ "Fisher only",
-    TRUE ~ "Neither"
-  ))
-
-summary_methods <- method_compare %>% count(category, name = "N")
-print(summary_methods)
-
-# ── Prepare plotting data: show significant AEs for each method (top 15 by |log(OR)|)
-sig_long <- bind_rows(
-  ae_or_df %>% filter(p_wald_adj < 0.05) %>%
-    transmute(canon_term, OR, L95, U95, method = "Wald (BH)"),
-  ae_or_df %>% filter(p_fisher_adj < 0.05) %>%
-    transmute(canon_term, OR, L95, U95, method = "Mid-p Fisher (BH)")
-) %>%
-  group_by(method) %>%
-  slice_max(order_by = abs(log(OR)), n = 15, with_ties = FALSE) %>%
-  ungroup() %>%
-  mutate(dir = if_else(OR > 1, "Female", "Male"))
-
-# ── Faceted forest: left = Wald, right = mid-p Fisher (same OR/CI; methods differ in p-values)
-ggplot(sig_long, aes(x = OR, y = fct_reorder(canon_term, OR), colour = dir, shape = dir)) +
-  geom_pointrange(aes(xmin = L95, xmax = U95), position = position_dodge(width = 0.6), size = 0.9) +
-  geom_point(position = position_dodge(width = 0.6), size = 2) +
-  geom_vline(xintercept = 1, linetype = "dashed") +
-  scale_x_log10(breaks = c(0.5, 1, 1.5, 3)) +
-  scale_colour_manual(values = c(Female = "#C51B7D", Male = "#0087BD"),
-                      labels = c(Female = "Higher in females", Male = "Higher in males"),
-                      name = NULL) +
-  scale_shape_manual(values = c(Female = 16, Male = 17),
-                     labels = c(Female = "Higher in females", Male = "Higher in males"),
-                     name = NULL) +
-  facet_wrap(~ method, nrow = 1, scales = "free_y") +
-  labs(title = "Female vs Male odds ratios for cardiovascular AEs",
-       subtitle = "Left: Wald (BH). Right: mid-p Fisher (BH). Forests show OR & Wald 95% CI; methods differ in p-values.",
-       x = "Odds ratio (Female / Male, log scale)", y = NULL) +
-  theme_minimal(base_size = 11) +
+  scale_color_manual(values = c("Higher in females" = "#C51B7D", "Higher in males" = "#0087BD")) +
+  scale_shape_manual(values = c("Higher in females" = 16, "Higher in males" = 17)) +
+  labs(
+    title = "Adjusted Sex Differences in Cardiovascular Adverse Events",
+    subtitle = "Female–male odds ratios adjusted for drug; confidence intervals at 95%. BH-adjusted p < 0.05",
+    x = "Common odds ratio (log scale)",
+    y = NULL,
+    color = NULL,
+    shape = NULL
+  ) +
+  theme_minimal(11) +
   theme(legend.position = "bottom")
